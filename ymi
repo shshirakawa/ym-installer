@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# Yandex Music Installer & Updater (ymi)
+# Author: Sh.Shirakawa — https://shshirakawa.com
+
+set -eo pipefail
+
+R="\033[0m"
+B="\033[1m"
+D="\033[2m"
+C_BLUE="\033[38;5;33m"
+C_SKY="\033[38;5;117m"
+C_GREEN="\033[38;5;36m"
+C_ORANGE="\033[38;5;214m"
+C_YELLOW="\033[38;5;226m"
+C_RED="\033[38;5;166m"
+C_WHITE="\033[38;5;255m"
+
+readonly UPDATE_BASE_URL="https://music-desktop-application.s3.yandex.net/stable"
+readonly MANIFEST_URL="${UPDATE_BASE_URL}/latest-linux.yml"
+readonly PACKAGE_NAME="yandex-music"
+readonly SELF_BIN="/usr/local/bin/ymi"
+
+REMOTE_VER=""
+REMOTE_DEB_URL=""
+REMOTE_SHA512=""
+
+info()  { echo -e "${C_BLUE}[i]${R} $*"; }
+ok()    { echo -e "${C_GREEN}[✓]${R} ${B}$*${R}"; }
+warn()  { echo -e "${C_ORANGE}[!]${R} $*"; }
+err()   { echo -e "${C_RED}[✗]${R} $*" >&2; }
+die()   { err "$*"; exit 1; }
+sep()   { echo -e "${D}────────────────────────────────────${R}"; }
+
+banner() {
+    printf "${C_BLUE}${B}"
+    echo "  ██╗   ██╗███╗   ███╗██╗"
+    echo "  ╚██╗ ██╔╝████╗ ████║██║"
+    echo "   ╚████╔╝ ██╔████╔██║██║"
+    echo "    ╚██╔╝  ██║╚██╔╝██║██║"
+    echo "     ██║   ██║ ╚═╝ ██║██║"
+    echo "     ╚═╝   ╚═╝     ╚═╝╚═╝"
+    echo -e "${R}${C_WHITE}${B}  Yandex Music Installer & Updater${R}"
+    echo -e "  ${D}Автор: ${C_WHITE}Sh.Shirakawa${R}"
+    echo -e "  ${D}Сайт:  ${C_SKY}https://shshirakawa.com${R}"
+    echo
+}
+
+show_help() {
+    banner
+    echo -e "${C_SKY}${B}Яндекс Музыка:${R}"
+    echo -e "  ${C_GREEN}install${R} - Установить"
+    echo -e "  ${C_GREEN}check${R} - Проверить версию"
+    echo -e "  ${C_GREEN}update${R} - Обновить"
+    echo -e "  ${C_GREEN}delete${R} - Удалить"
+    echo -e "  ${C_GREEN}launch${R} - Запустить"
+    echo
+    echo -e "${C_SKY}${B}Скрипт:${R}"
+    echo -e "  ${C_ORANGE}-m install${R} - Добавить ymi в /usr/local/bin"
+    echo -e "  ${C_ORANGE}-m delete${R} - Убрать ymi из системы"
+    echo
+}
+
+guard_no_root() {
+    [[ "$EUID" -ne 0 ]] || die "Не запускай от root.\n       makepkg сам попросит sudo когда нужно."
+}
+
+guard_arch() {
+    local arch; arch=$(uname -m)
+    [[ "$arch" == "x86_64" ]] || die "Только x86_64. У тебя: ${arch}"
+}
+
+guard_deps() {
+    local missing=()
+    for bin in pacman makepkg bsdtar curl; do
+        command -v "$bin" &>/dev/null || missing+=("$bin")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "Не хватает утилит: ${missing[*]}"
+        echo -e "    ${C_GREEN}sudo pacman -S --needed base-devel curl${R}"
+        exit 1
+    fi
+}
+
+guard_disk_space() {
+    local required_mb=${1:-300}
+    local tmp_free_mb
+    tmp_free_mb=$(df --output=avail -m /tmp 2>/dev/null | tail -1 | tr -d ' ' || echo 0)
+    if (( tmp_free_mb < required_mb )); then
+        die "Мало места в /tmp. Нужно ~${required_mb} МБ, есть ${tmp_free_mb} МБ."
+    fi
+}
+
+guard_install_env() {
+    guard_no_root
+    guard_arch
+    guard_deps
+    guard_disk_space 300
+}
+
+local_version() {
+    pacman -Q "${PACKAGE_NAME}" 2>/dev/null | awk '{print $2}' | cut -d'-' -f1 || true
+}
+
+fetch_manifest() {
+    info "Проверяю версию..."
+
+    local raw
+    raw=$(curl -sL --max-time 20 "${MANIFEST_URL}" 2>/dev/null) \
+        || die "Нет связи с сервером Яндекса."
+
+    [[ -n "$raw" ]] || die "Сервер ответил пустотой. Попробуй позже."
+
+    REMOTE_VER=$(echo "$raw" | awk '/^version:/{print $2}' | tr -d '"\r ')
+    local remote_path
+    remote_path=$(echo "$raw" | awk '/^path:/{print $2}' | tr -d '"\r ')
+
+    [[ -n "$REMOTE_VER" && -n "$remote_path" ]] \
+        || die "Не удалось разобрать манифест. Формат мог измениться."
+
+    REMOTE_DEB_URL="${UPDATE_BASE_URL}/${remote_path}"
+
+    # base64 sha512 → hex; fallback to SKIP if conversion fails
+    local b64
+    b64=$(echo "$raw" | awk '/^sha512:/{found=1; next} found{print; exit}' | tr -d ' "\r>-')
+    if [[ -n "$b64" ]]; then
+        REMOTE_SHA512=$(printf '%s' "$b64" | base64 -d 2>/dev/null \
+                        | od -An -v -tx1 2>/dev/null | tr -d ' \n' || true)
+    fi
+    [[ ${#REMOTE_SHA512} -eq 128 ]] || REMOTE_SHA512="SKIP"
+}
+
+build_and_install() {
+    local ver="$1" deb_url="$2" sha="$3"
+
+    local build_dir
+    build_dir=$(mktemp -d /tmp/ymi_build.XXXXXX)
+
+    # shellcheck disable=SC2064
+    trap "rm -rf '${build_dir}'" EXIT INT TERM HUP
+
+    info "Сборка в ${D}${build_dir}${R}"
+
+    cat > "${build_dir}/PKGBUILD" << PKGBUILD
+pkgname=${PACKAGE_NAME}
+pkgver=${ver}
+pkgrel=1
+pkgdesc="Официальное приложение Яндекс Музыка для Linux"
+arch=('x86_64')
+url="https://music.yandex.ru/download/"
+license=('LicenseRef-proprietary')
+depends=(
+    'alsa-lib' 'gtk3' 'libnotify' 'nss' 'libxss'
+    'libxtst' 'xdg-utils' 'at-spi2-core' 'util-linux-libs' 'libsecret'
+)
+optdepends=('libappindicator-gtk3: иконка в системном трее')
+options=('!strip' '!debug')
+source=("${deb_url}")
+sha512sums=('${sha}')
+
+package() {
+    bsdtar -xf data.tar.* --directory "\${pkgdir}"
+    mv "\${pkgdir}/opt/Яндекс Музыка" "\${pkgdir}/opt/yandex-music"
+    rm -f "\${pkgdir}/opt/yandex-music/resources/app-update.yml"
+    rm -f "\${pkgdir}/opt/yandex-music/resources/package-type"
+
+    local desktop="\${pkgdir}/usr/share/applications/yandexmusic.desktop"
+    sed -i \
+        -e 's|/opt/Яндекс Музыка|/opt/yandex-music|g' \
+        -e 's|Name=Яндекс Музыка|Name=Yandex Music\nName[ru]=Яндекс Музыка|g' \
+        -e 's|StartupWMClass=Яндекс Музыка|StartupWMClass=YandexMusic|g' \
+        -e 's|Categories=Audio;|Categories=AudioVideo;Audio;Player;Music;|g' \
+        -e 's|Exec=.*|Exec=/usr/bin/yandex-music %U|g' \
+        "\${desktop}"
+
+    install -dm755 "\${pkgdir}/usr/bin"
+    printf '#!/bin/sh\nexec /opt/yandex-music/yandexmusic --gtk-version=3 "\$@"\n' \
+        > "\${pkgdir}/usr/bin/yandex-music"
+    chmod 755 "\${pkgdir}/usr/bin/yandex-music"
+}
+PKGBUILD
+
+    info "Скачиваю и собираю пакет..."
+    (cd "${build_dir}" && makepkg -sic --noconfirm)
+}
+
+cmd_install() {
+    guard_install_env
+
+    local local_ver; local_ver=$(local_version)
+    if [[ -n "$local_ver" ]]; then
+        warn "Уже установлена, версия ${C_GREEN}${local_ver}${R}."
+        echo -e "  Обновить: ${C_GREEN}ymi update${R}"
+        exit 0
+    fi
+
+    fetch_manifest
+    info "Версия: ${C_SKY}${REMOTE_VER}${R}"
+    build_and_install "${REMOTE_VER}" "${REMOTE_DEB_URL}" "${REMOTE_SHA512}"
+
+    echo
+    ok "Готово! Яндекс Музыка ${REMOTE_VER} установлена."
+    echo -e "  Запуск: ${C_SKY}yandex-music${R}"
+    echo
+}
+
+cmd_check() {
+    guard_deps
+    guard_arch
+
+    local local_ver; local_ver=$(local_version)
+    fetch_manifest
+
+    local ver_local_str
+    if [[ -n "$local_ver" ]]; then
+        ver_local_str="${C_GREEN}${local_ver}${R}"
+    else
+        ver_local_str="${C_YELLOW}не установлена${R}"
+    fi
+
+    echo
+    sep
+    echo -e "  Установлена: ${ver_local_str}"
+    echo -e "  На сервере: ${C_SKY}${REMOTE_VER}${R}"
+    sep
+    echo
+
+    if [[ -z "$local_ver" ]]; then
+        warn "Не установлена. → ${C_GREEN}ymi install${R}"
+    elif [[ "$local_ver" == "$REMOTE_VER" ]]; then
+        ok "Актуальная версия."
+    else
+        warn "Есть обновление: ${C_SKY}${REMOTE_VER}${R} (сейчас ${local_ver})."
+        echo -e "  → ${C_GREEN}ymi update${R}"
+    fi
+    echo
+}
+
+cmd_update() {
+    guard_install_env
+
+    local local_ver; local_ver=$(local_version)
+    if [[ -z "$local_ver" ]]; then
+        warn "Не установлена. → ${C_GREEN}ymi install${R}"
+        exit 0
+    fi
+
+    info "Версия сейчас: ${C_WHITE}${local_ver}${R}"
+    fetch_manifest
+
+    if [[ "$local_ver" == "$REMOTE_VER" ]]; then
+        ok "Версия ${C_GREEN}${local_ver}${R} — актуальная."
+        exit 0
+    fi
+
+    info "Обновление: ${C_WHITE}${local_ver}${R} → ${C_SKY}${REMOTE_VER}${R}"
+    build_and_install "${REMOTE_VER}" "${REMOTE_DEB_URL}" "${REMOTE_SHA512}"
+
+    echo
+    ok "Готово! Обновлена до ${REMOTE_VER}."
+    echo
+}
+
+cmd_delete() {
+    guard_deps
+
+    local local_ver; local_ver=$(local_version)
+    if [[ -z "$local_ver" ]]; then
+        warn "Не установлена."
+        exit 0
+    fi
+
+    echo
+    warn "Удаляю Яндекс Музыку ${C_WHITE}${local_ver}${R} и ненужные зависимости."
+    echo -e "  ${D}Файлы, иконки, ярлыки — всё уйдёт.${R}"
+    echo
+    read -r -p "  Продолжить? [д/Н]: " answer
+    case "${answer,,}" in
+        д|да|y|yes) ;;
+        *) info "Отменено."; exit 0 ;;
+    esac
+
+    echo
+    sudo pacman -Rns --noconfirm "${PACKAGE_NAME}"
+    echo
+    ok "Системные файлы удалены."
+
+    local user_dirs=(
+        "${HOME}/.config/YandexMusic"
+        "${HOME}/.config/yandex-music"
+        "${HOME}/.cache/yandex-music-desktop"
+    )
+
+    local existing=()
+    for d in "${user_dirs[@]}"; do
+        [[ -d "$d" ]] && existing+=("$d")
+    done
+
+    if [[ ${#existing[@]} -gt 0 ]]; then
+        echo
+        warn "Найдены данные пользователя:"
+        for d in "${existing[@]}"; do
+            echo -e "    ${D}${d}${R}"
+        done
+        echo
+        read -r -p "  Удалить настройки и кэш? [д/Н]: " answer
+        case "${answer,,}" in
+            д|да|y|yes)
+                rm -rf "${existing[@]}"
+                ok "Очищено."
+                ;;
+            *)
+                info "Оставлено."
+                ;;
+        esac
+    fi
+
+    echo
+    ok "Готово. Следов нет."
+    echo
+}
+
+cmd_self_install() {
+    local src; src=$(realpath "$0" 2>/dev/null) \
+        || die "Не найти путь к скрипту."
+
+    [[ -f "$src" ]] || die "Файл не найден: ${src}"
+
+    [[ -f "$SELF_BIN" ]] && warn "Уже есть в ${SELF_BIN}, перезаписываю..."
+
+    info "Ставлю ymi в систему..."
+    sudo install -Dm755 "$src" "$SELF_BIN"
+
+    echo
+    ok "Готово! ymi теперь везде в терминале."
+    echo
+}
+
+cmd_self_delete() {
+    if [[ ! -f "$SELF_BIN" ]]; then
+        warn "ymi не установлена в системе."
+        exit 0
+    fi
+
+    info "Убираю ymi из системы..."
+    sudo rm -f "$SELF_BIN"
+
+    echo
+    ok "Удалено."
+    echo
+}
+
+cmd_launch() {
+    if ! command -v yandex-music &>/dev/null; then
+        warn "Не установлена. → ${C_GREEN}ymi install${R}"
+        exit 1
+    fi
+    yandex-music &>/dev/null &
+    disown
+}
+
+main() {
+    case "${1:-}" in
+        install)        cmd_install      ;;
+        check)          cmd_check        ;;
+        update)         cmd_update       ;;
+        delete)         cmd_delete       ;;
+        launch)         cmd_launch       ;;
+        -m)
+            case "${2:-}" in
+                install)    cmd_self_install ;;
+                delete)     cmd_self_delete  ;;
+                *)          die "Неизвестно: 'ymi -m ${2:-}'.\n       Можно: ${C_ORANGE}ymi -m install${R} · ${C_ORANGE}ymi -m delete${R}" ;;
+            esac
+            ;;
+        "")
+            show_help
+            ;;
+        *)
+            err "Нет такой команды: '${1}'."
+            echo
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
