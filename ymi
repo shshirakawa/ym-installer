@@ -19,6 +19,7 @@ readonly UPDATE_BASE_URL="https://music-desktop-application.s3.yandex.net/stable
 readonly MANIFEST_URL="${UPDATE_BASE_URL}/latest-linux.yml"
 readonly PACKAGE_NAME="yandex-music"
 readonly SELF_BIN="/usr/local/bin/ymi"
+readonly SELF_RAW_URL="https://raw.githubusercontent.com/shshirakawa/ym-installer/main/ymi"
 
 REMOTE_VER=""
 REMOTE_DEB_URL=""
@@ -56,7 +57,9 @@ show_help() {
     echo
     echo -e "${C_SKY}${B}Скрипт:${R}"
     echo -e "  ${C_ORANGE}-m install${R} - Добавить ymi в /usr/local/bin"
-    echo -e "  ${C_ORANGE}-m delete${R} - Убрать ymi из системы"
+    echo -e "  ${C_ORANGE}-m update${R}  - Обновить ymi из GitHub"
+    echo -e "  ${C_ORANGE}-m clean${R}   - Удалить мусор от прерванных сборок"
+    echo -e "  ${C_ORANGE}-m delete${R}  - Убрать ymi из системы"
     echo
 }
 
@@ -345,6 +348,68 @@ cmd_self_install() {
     echo
 }
 
+cmd_self_clean() {
+    local dirs=( /tmp/ymi_build.* )
+    local found=()
+
+    for d in "${dirs[@]}"; do
+        [[ -d "$d" ]] && found+=("$d")
+    done
+
+    if [[ ${#found[@]} -eq 0 ]]; then
+        ok "Мусора нет — всё чисто."
+        return 0
+    fi
+
+    echo
+    warn "Найдены осколки сборок:"
+    local total_kb=0
+    for d in "${found[@]}"; do
+        local kb; kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+        total_kb=$(( total_kb + kb ))
+        echo -e "    ${D}${d}${R}  ${C_YELLOW}~$(( kb / 1024 )) МБ${R}"
+    done
+    echo -e "  ${B}Итого:${R} ~$(( total_kb / 1024 )) МБ"
+    echo
+
+    rm -rf "${found[@]}"
+    ok "Очищено (${#found[@]} директ.)."
+    echo
+}
+
+cmd_self_update() {
+    info "Проверяю обновление ymi..."
+
+    [[ -f "$SELF_BIN" ]] || die "ymi не установлена в системе. Сначала: ${C_GREEN}ymi -m install${R}"
+
+    local tmp_file
+    tmp_file=$(mktemp /tmp/ymi_update.XXXXXX)
+    # shellcheck disable=SC2064
+    trap "rm -f '${tmp_file}'" EXIT INT TERM HUP
+
+    curl -sL --max-time 20 --fail "${SELF_RAW_URL}" -o "${tmp_file}" \
+        || die "Не удалось скачать обновление. Проверь соединение."
+
+    [[ -s "$tmp_file" ]] || die "Скачался пустой файл."
+
+    # Сравниваем контрольные суммы
+    local cur_sum new_sum
+    cur_sum=$(sha256sum "$SELF_BIN"  | awk '{print $1}')
+    new_sum=$(sha256sum "$tmp_file" | awk '{print $1}')
+
+    if [[ "$cur_sum" == "$new_sum" ]]; then
+        ok "ymi уже актуальная."
+        return 0
+    fi
+
+    info "Устанавливаю новую версию..."
+    sudo install -Dm755 "${tmp_file}" "${SELF_BIN}"
+
+    echo
+    ok "ymi обновлена."
+    echo
+}
+
 cmd_self_delete() {
     if [[ ! -f "$SELF_BIN" ]]; then
         warn "ymi не установлена в системе."
@@ -378,8 +443,10 @@ main() {
         -m)
             case "${2:-}" in
                 install)    cmd_self_install ;;
+                update)     cmd_self_update  ;;
+                clean)      cmd_self_clean   ;;
                 delete)     cmd_self_delete  ;;
-                *)          die "Неизвестно: 'ymi -m ${2:-}'.\n       Можно: ${C_ORANGE}ymi -m install${R} · ${C_ORANGE}ymi -m delete${R}" ;;
+                *)          die "Неизвестно: 'ymi -m ${2:-}'.\n       Можно: ${C_ORANGE}ymi -m install${R} · ${C_ORANGE}ymi -m update${R} · ${C_ORANGE}ymi -m clean${R} · ${C_ORANGE}ymi -m delete${R}" ;;
             esac
             ;;
         "")
