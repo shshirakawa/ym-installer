@@ -140,6 +140,16 @@ build_and_install() {
 
     info "Сборка в ${D}${build_dir}${R}"
 
+    # Проверяем, что файл реально существует и не является заглушкой (< 1 МБ)
+    info "Проверяю доступность пакета..."
+    local remote_size
+    remote_size=$(curl -sI --max-time 20 -L "${deb_url}" 2>/dev/null \
+        | grep -i "^content-length:" | tail -1 | tr -d ' \r' | cut -d: -f2)
+    if [[ -z "$remote_size" || "$remote_size" -lt 1048576 ]]; then
+        die "Файл пакета недоступен или повреждён (размер: ${remote_size:-?} байт).
+       Вероятно, Яндекс ещё не опубликовал релиз ${ver} — попробуй позже."
+    fi
+
     cat > "${build_dir}/PKGBUILD" << PKGBUILD
 pkgname=${PACKAGE_NAME}
 pkgver=${ver}
