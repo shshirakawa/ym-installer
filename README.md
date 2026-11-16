@@ -3,7 +3,6 @@
 Автоустановщик и менеджер обновлений Яндекс Музыки для Arch Linux, CachyOS и других Arch-based дистрибутивов.
 
 **Автор:** [Sh.Shirakawa](https://shshirakawa.com)
-
 **Лицензия:** MIT
 
 ---
